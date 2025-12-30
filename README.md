@@ -1,1 +1,1 @@
-# GuideNet
+# CMGN
