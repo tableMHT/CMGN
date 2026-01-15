@@ -8,11 +8,6 @@ import math
 # BandFuser
 # ----------------------------
 class BandFuser(nn.Module):
-    """
-    BandFuser: 把 (62通道 × 5频段) 转换为一个统一的表示
-    - band_fusion=True: 每个通道内 5 个频段通过 MLP 融合到 band_embed_dim，再拼接所有通道
-    - band_fusion=False: 直接把所有频段展平
-    """
     def __init__(self, n_chan=62, n_band=5, band_embed=4, band_fusion=True):
         super().__init__()
         self.band_fusion = band_fusion
@@ -152,9 +147,6 @@ class FRModule(nn.Module):
         out = torch.matmul(attn, v).permute(0,2,1,3).contiguous().view(B,T,-1)
         return self.out(out)
 
-# ----------------------------
-# 主模型
-# ----------------------------
 
 class DE_FG_FR_Model(nn.Module):
     def __init__(self, cfg, n_chan=62, n_band=5, eye_dim=None, num_classes=7):
@@ -196,18 +188,18 @@ class DE_FG_FR_Model(nn.Module):
         self.film = FiLMBlock(d_eeg, d_eye)
         self.fr = FRModule(d_eye, cfg['fr_heads'], cfg['fr_dk'])
 
-        # ---- T-CMC 对比头（可选）----
+        # ---- T-CMC ----
         if cfg.get('tcmc_enabled', False):
             self.tcmc = TemporalContrastHead(proj_dim=min(d_eeg, d_eye),
                                              temp=cfg.get('tcmc_temp', 0.07),
                                              pos_window=cfg.get('tcmc_pos_window', 0))
-            # 若d不一致，额外投影到相同维度
+
             self.align_eeg = nn.Linear(d_eeg, min(d_eeg, d_eye), bias=False)
             self.align_eye = nn.Linear(d_eye, min(d_eeg, d_eye), bias=False)
         else:
             self.tcmc = None
 
-        # ---- StyleGate + 分类器 ----
+        # ---- StyleGate ----
         fusion_dim = d_eeg + d_eye
         self.style_gate = StyleGate(fusion_dim)
         self.classifier = nn.Sequential(
@@ -218,27 +210,23 @@ class DE_FG_FR_Model(nn.Module):
         )
 
     def forward(self, eeg_seq, eye_seq, lengths, mask):
-        # 1) 频段融合 & 眼动投影
         eeg_feat = self.bandfuser(eeg_seq)      # (B,T,D_eeg_in)
         eye_feat = self.eye_proj(eye_seq)       # (B,T,D_eye_in)
 
-        # 2) 时间编码
         eeg_enc = self.eeg_encoder(eeg_feat, mask)  # (B,T,D_eeg)
         eye_enc = self.eye_encoder(eye_feat, mask)  # (B,T,D_eye)
 
-        # 3) 时间对齐（若T不同）
         if eeg_enc.size(1) != eye_enc.size(1):
             minT = min(eeg_enc.size(1), eye_enc.size(1))
             eeg_enc, eye_enc, mask = eeg_enc[:, :minT], eye_enc[:, :minT], mask[:, :minT]
 
         aux = {}
-        # 4) 可选：逐时刻跨模态对比损失（训练用）
         if self.training and self.tcmc is not None:
             z_eeg = self.align_eeg(eeg_enc)
             z_eye = self.align_eye(eye_enc)
             aux['tcmc_loss'] = self.tcmc(z_eeg, z_eye, mask)
 
-        # 5) FiLM 调制 + FR
+        # FiLM  + FR
         gamma, beta = self.film(eeg_enc)
         if gamma.size(-1) != eye_enc.size(-1):
             proj = nn.Linear(gamma.size(-1), eye_enc.size(-1)).to(eye_enc.device)
@@ -246,12 +234,10 @@ class DE_FG_FR_Model(nn.Module):
         eye_mod = gamma * eye_enc + beta
         eye_fr = self.fr(eye_mod, mask)
 
-        # 6) 池化（mask加权平均）
         mask_f = mask.float().unsqueeze(-1)
         eeg_pool = (eeg_enc * mask_f).sum(1) / (mask_f.sum(1) + 1e-8)
         eye_pool = (eye_fr * mask_f).sum(1) / (mask_f.sum(1) + 1e-8)
 
-        # 7) StyleGate + 分类头
         z = torch.cat([eeg_pool, eye_pool], dim=-1)
         z = self.style_gate(z)
         logits = self.classifier(z)
@@ -273,7 +259,6 @@ class DE_FG_FR_Model(nn.Module):
         # FR
         self.fr = FRModule(self.eye_encoder.out_dim, cfg['fr_heads'], cfg['fr_dk'])
 
-        # 分类器
         self.classifier = nn.Sequential(
             nn.Linear(self.eeg_encoder.out_dim+self.eye_encoder.out_dim, cfg['mlp_dim']),
             nn.ReLU(),
@@ -288,7 +273,6 @@ class DE_FG_FR_Model(nn.Module):
         eeg_enc = self.eeg_encoder(eeg_feat,mask)  # (B,T,D_eeg)
         eye_enc = self.eye_encoder(eye_feat,mask)  # (B,T,D_eye)
 
-        # 对齐时间长度
         if eeg_enc.size(1)!=eye_enc.size(1):
             minT=min(eeg_enc.size(1),eye_enc.size(1))
             eeg_enc,eye_enc,mask=eeg_enc[:,:minT],eye_enc[:,:minT],mask[:,:minT]
@@ -306,15 +290,7 @@ class DE_FG_FR_Model(nn.Module):
 
         return self.classifier(torch.cat([eeg_pool,eye_pool],dim=-1))
 
-
-# ----------------------------
-# Tiny SSM / Hyena-like Encoders (轻量实现，接口与Transformer一致)
-# ----------------------------
 class SSMLayerTiny(nn.Module):
-    """
-    一个极简的SSM近似：用可学习一维卷积核去逼近长程依赖（深度可堆叠）
-    注意：这是工程上可跑的轻量替代，便于快速集成与对比。
-    """
     def __init__(self, d_model, kernel_size=25, dropout=0.1):
         super().__init__()
         padding = kernel_size//2
@@ -344,9 +320,6 @@ class SSMTimeEncoder(nn.Module):
         return x
 
 class HyenaBlockTiny(nn.Module):
-    """
-    极简Hyena风格：使用多尺度空洞卷积近似长卷积核，带残差与归一化。
-    """
     def __init__(self, d_model, dilations=(1,2,4,8), dropout=0.1):
         super().__init__()
         self.convs = nn.ModuleList([
@@ -380,15 +353,7 @@ class HyenaTimeEncoder(nn.Module):
             x = layer(x, mask)
         return x
 
-# ----------------------------
-# StyleGate：用于TENT-Style 的轻量风格门控
-# ----------------------------
 class StyleGate(nn.Module):
-    """
-    对融合后的向量 z 施加逐通道的仿射变换：y = alpha * z + beta
-    - alpha, beta 初始化为 1, 0；训练时与分类头一同学习
-    - 测试时自适应（TENT-Style）只解冻 alpha/beta
-    """
     def __init__(self, dim):
         super().__init__()
         self.alpha = nn.Parameter(torch.ones(dim))
@@ -396,9 +361,7 @@ class StyleGate(nn.Module):
     def forward(self, z):
         return z * self.alpha + self.beta
 
-# ----------------------------
-# T-CMC 逐时刻跨模态对比头
-# ----------------------------
+
 class TemporalContrastHead(nn.Module):
     def __init__(self, proj_dim, temp=0.07, pos_window=0):
         super().__init__()
@@ -408,16 +371,10 @@ class TemporalContrastHead(nn.Module):
         self.pos_window = pos_window
 
     def forward(self, eeg_enc, eye_enc, mask):
-        """
-        eeg_enc, eye_enc: (B,T,D) 经过时间编码后的表示
-        mask: (B,T)      有效时间步
-        返回：InfoNCE 对比损失 (标量)
-        """
         B,T,D = eeg_enc.size()
         eeg = F.normalize(self.proj_eeg(eeg_enc), dim=-1)
         eye = F.normalize(self.proj_eye(eye_enc), dim=-1)
 
-        # 相似度：逐batch独立计算，避免跨样本泄露
         loss = 0.0
         eps = 1e-8
         for b in range(B):
