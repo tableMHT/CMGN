@@ -48,9 +48,7 @@ def eval_one_epoch(model, dataloader, device):
     return epoch_loss, acc, f1, cm
 
 def tent_style_eval(model, dataloader, device, cfg):
-    """测试时自适应：只更新分类头和style_gate参数；目标是最小化熵+轻微正则。"""
     model.eval()
-    # 仅用于TTA的优化器
     adaptable = []
     if hasattr(model, 'classifier'):
         adaptable += list(model.classifier.parameters())
@@ -66,13 +64,11 @@ def tent_style_eval(model, dataloader, device, cfg):
     y_true_all, y_pred_all = [], []
     for eegs, eyes, labels, lengths, mask in tqdm(dataloader, desc='eval(TENT-Style)', leave=False):
         eegs = eegs.to(device); eyes = eyes.to(device); labels = labels.to(device); mask = mask.to(device)
-        # 小内循环：仅当前batch自适应若干步
         for _ in range(steps):
             optimizer.zero_grad(set_to_none=True)
-            logits = model(eegs, eyes, lengths, mask)  # forward中不需要aux
+            logits = model(eegs, eyes, lengths, mask)  
             prob = F.softmax(logits, dim=1)
             entropy = -(prob * (prob.clamp_min(1e-6).log())).sum(dim=1).mean()
-            # 轻量风格正则：alpha接近1, beta接近0
             reg = 0.0
             if hasattr(model, 'style_gate'):
                 reg = reg_w * ((model.style_gate.alpha-1.0).pow(2).mean() + (model.style_gate.beta-0.0).pow(2).mean())
@@ -80,7 +76,6 @@ def tent_style_eval(model, dataloader, device, cfg):
             loss.backward()
             optimizer.step()
 
-        # 使用更新后的参数得到最终预测
         with torch.no_grad():
             logits = model(eegs, eyes, lengths, mask)
             loss = F.cross_entropy(logits, labels)
